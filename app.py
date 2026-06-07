@@ -149,8 +149,9 @@ def fetch_binance_full_history():
             candles_by_date[dt] = all_candles[ts]
         closes = [all_candles[ts]["close"] for ts in sorted_ts]
         vols   = [all_candles[ts]["vol"]   for ts in sorted_ts]
-        return closes, vols, candles_by_date
-    return [], [], {}
+        timestamps = [ts // 1000 for ts in sorted_ts]   # ms → s, alinhado a closes
+        return closes, vols, candles_by_date, timestamps
+    return [], [], {}, []
 
 def extract_price_target_from_query(query):
     """Detecta se a pergunta menciona um nível de preço-alvo (ex: 65k, $98.000, 100000)."""
@@ -225,9 +226,9 @@ def get_candle_for_date(candles_by_date, target_dt):
 @st.cache_data(ttl=3600)
 def get_indicators():
     errors = []
-    closes_d, vols_d, candles_by_date = [], [], {}
+    closes_d, vols_d, candles_by_date, timestamps_d = [], [], {}, []
 
-    closes_d, vols_d, candles_by_date = fetch_binance_full_history()
+    closes_d, vols_d, candles_by_date, timestamps_d = fetch_binance_full_history()
 
     # Fallback simples
     if len(closes_d) < 50:
@@ -242,6 +243,7 @@ def get_indicators():
                 if isinstance(raw, list) and len(raw) > 0 and isinstance(raw[0], list):
                     closes_d = [float(c[4]) for c in raw]
                     vols_d   = [float(c[7]) for c in raw]
+                    timestamps_d = [int(c[0]) // 1000 for c in raw]
         except Exception as e:
             errors.append(f"Binance fallback: {e}")
 
@@ -359,6 +361,53 @@ def get_indicators():
     cross = "Golden Cross ativo" if (ema50d and ema200d and ema50d > ema200d) else \
             "Death Cross ativo" if (ema50d and ema200d) else "Indefinido"
 
+    # ── REGIME DE MERCADO (definição precisa) ────────────────────────────────
+    # Bear Market  = 2+ semanas consecutivas ABAIXO da EMA50 semanal
+    # Bull Market  = 2+ semanas consecutivas ACIMA  da EMA50 semanal
+    # Alerta       = 1 semana (aguardando confirmação)
+    bear_status_btc  = "indefinido"
+    weeks_below_e50w = 0
+    weeks_above_e50w = 0
+    ema50_w_val      = weekly.get("EMA50")
+
+    if ema50_w_val and len(closes_w) >= 4:
+        consec_below = 0
+        consec_above = 0
+        for cw in reversed(closes_w[-12:]):
+            if cw < ema50_w_val:
+                if consec_above == 0:
+                    consec_below += 1
+                else:
+                    break
+            else:
+                if consec_below == 0:
+                    consec_above += 1
+                else:
+                    break
+        weeks_below_e50w = consec_below
+        weeks_above_e50w = consec_above
+
+        if consec_below >= 2:
+            bear_status_btc = (
+                f"⛔ BEAR MARKET CONFIRMADO — {consec_below} semanas consecutivas "
+                f"abaixo da EMA50 semanal (${ema50_w_val:,.0f})"
+            )
+        elif consec_above >= 2:
+            bear_status_btc = (
+                f"✅ BULL MARKET — {consec_above} semanas consecutivas "
+                f"acima da EMA50 semanal (${ema50_w_val:,.0f})"
+            )
+        elif consec_below == 1:
+            bear_status_btc = (
+                f"⚠️ ALERTA BEAR — 1 semana abaixo da EMA50 semanal (${ema50_w_val:,.0f}). "
+                f"Precisa de mais 1 semana para confirmar bear market."
+            )
+        elif consec_above == 1:
+            bear_status_btc = (
+                f"⚠️ POSSÍVEL RETORNO AO BULL — 1 semana acima da EMA50 semanal (${ema50_w_val:,.0f}). "
+                f"Precisa de mais 1 semana para confirmar bull market."
+            )
+
     return {
         "price": price, "change_24h": change_24h,
         "volume_24h": volume_24h, "vol_avg_30d": vol_avg_30d, "vol_ratio": vol_ratio,
@@ -372,9 +421,15 @@ def get_indicators():
         "dominance": dominance,
         "errors": errors,
         "updated": datetime.now().strftime("%H:%M:%S"),
+        # Regime de mercado calculado
+        "bear_status_btc":  bear_status_btc,
+        "weeks_below_e50w": weeks_below_e50w,
+        "weeks_above_e50w": weeks_above_e50w,
+        "ema50_w":          ema50_w_val,
         # Dados brutos para analytics e busca histórica
         "_closes": closes_d,
         "_vols":   vols_d,
+        "_timestamps": timestamps_d,
         "_candles_by_date": candles_by_date,
     }
 
@@ -594,7 +649,31 @@ def build_prompt(ind, macro, deriv, historical_candle=None, level_target=None, s
     macro_ctx = "\nMACRO EUA:\n" + "\n".join(macro_lines) if macro_lines else ""
     deriv_ctx = "\nDERIVATIVOS:\n" + "\n".join(deriv_lines) if deriv_lines else ""
 
+    # ── Regime de mercado (calculado em Python — não pode ser alterado pela IA) ──
+    bear_status_btc  = ind.get("bear_status_btc", "indefinido — dados insuficientes")
+    weeks_below_e50w = ind.get("weeks_below_e50w", 0)
+    weeks_above_e50w = ind.get("weeks_above_e50w", 0)
+    ema50_w_val      = ind.get("ema50_w")
+
+    regime_ctx = f"""
+══════════════════════════════════════════════════════════════
+REGIME DE MERCADO ATUAL (calculado em Python — dado imutável)
+══════════════════════════════════════════════════════════════
+{bear_status_btc}
+
+DEFINIÇÃO USADA NESTE SISTEMA (não alterar):
+  Bear Market  = preço BTC abaixo da EMA50 SEMANAL por 2+ semanas consecutivas
+  Bull Market  = preço BTC acima  da EMA50 SEMANAL por 2+ semanas consecutivas
+  Alerta Bear  = 1 semana abaixo (ainda não confirmado)
+  Alerta Bull  = 1 semana acima  (ainda não confirmado)
+
+EMA50 semanal atual: {f"${ema50_w_val:,.0f}" if ema50_w_val else "N/A"}
+Semanas consecutivas abaixo da EMA50 semanal: {weeks_below_e50w}
+Semanas consecutivas acima  da EMA50 semanal: {weeks_above_e50w}
+══════════════════════════════════════════════════════════════"""
+
     data_ctx = f"""DADOS EM TEMPO REAL:
+{regime_ctx}
 
 Preço: ${p:,.0f} | Variação 24h: {ind['change_24h']}%
 ATH: $126.198 (out/2025) | Distância: {ind['dist_ath']}%
@@ -612,10 +691,13 @@ MÉDIAS SEMANAIS ({ind['candles_w']} semanas reais):
 REGRA: Nunca cite valores de médias que não estejam listados acima."""
 
     # Analytics automático sobre histórico completo
-    analytics_ctx = build_analytics_context(
-        ind.get("_closes", []),
-        ind.get("_vols", [])
-    )
+    try:
+        analytics_ctx = build_analytics_context(
+            ind.get("_closes", []),
+            ind.get("_vols", [])
+        )
+    except Exception:
+        analytics_ctx = ""
 
     # Candle histórico exato (se pergunta mencionar data)
     hist_ctx = ""
@@ -677,7 +759,7 @@ REGRAS:
 5. Probabilidades numéricas baseadas em frequência histórica real dos dados
 6. Cruze BTC + macro + derivativos + RSI + MACD + Bollinger simultaneamente
 7. Seja direto — diga o que os dados sugerem
-8. Se o campo bear_status indicar SMA50 semanal abaixo por +2 semanas → bear confirmado; acima → bull; senão → tendência indefinida
+8. REGIME DE MERCADO — USO OBRIGATÓRIO DO CAMPO CALCULADO: O campo "REGIME DE MERCADO ATUAL" já calculou o status em Python com dados reais. Use o valor exato sem questionar ou reinterpretar. Bear Market = 2+ semanas consecutivas ABAIXO da EMA50 semanal (calculado nos dados). Bull Market = 2+ semanas consecutivas ACIMA da EMA50 semanal. NUNCA use drawdown%, EMA200, ou outros critérios alternativos para definir bull/bear. Se o campo diz "BEAR MARKET CONFIRMADO", a resposta deve dizer bear market — sem qualificações como "transição" ou "possível bear".
 9. Nunca use linguagem de certeza — "em X de Y casos similares, foi Z"
 10. Considere o SCORE MACRO e cruze com o técnico antes de qualquer conclusão
 11. Petróleo na mínima histórica = risco de reversão inflacionária; S&P500 na máxima = risco de realização
@@ -685,7 +767,24 @@ REGRAS:
 13. Quando o BTC tiver poucos análogos próprios (<5 casos), usar os ciclos do S&P500 jovem (1950-1982) e do Ouro (1971-1980) como amostra complementar, ajustando a volatilidade em 3-5x e respeitando a compressão temporal do ciclo de 4 anos do halving
 14. RSI tem BAIXO PESO nas análises — é um indicador lagging que aparece igual em bear markets e bull markets. Nunca use RSI como argumento principal de probabilidade. O critério principal de similaridade é a ESTRUTURA: distância do ATH do ciclo, posição no range, estrutura de topos/fundos.
 15. S&P500 próximo do ATH histórico (distância < 8%) em tendência de alta SIGNIFICA continuação de alta — NÃO é sinal de reversão. RSI do S&P500 acima de 60 em trend de alta é normal. Só considere S&P500 como risco se: RSI semanal > 80, ou queda já iniciada > 5%, ou dado macro específico (recessão, Fed hawkish extremo).
-16. Ao identificar análogos históricos, priorize períodos com mesma FASE estrutural: se BTC está -50% do ATH com death cross, os análogos devem ser de outros bear markets (-40% a -60% do ATH), NUNCA de bull markets que acidentalmente tenham o mesmo RSI.{fb}"""
+16. Ao identificar análogos históricos, priorize períodos com mesma FASE estrutural: se BTC está -50% do ATH com death cross, os análogos devem ser de outros bear markets (-40% a -60% do ATH), NUNCA de bull markets que acidentalmente tenham o mesmo RSI.
+17. CONCLUSÃO DIRETA OBRIGATÓRIA: TODA resposta deve terminar com um bloco separado por linha em branco:
+   "---
+   **CONCLUSÃO DIRETA:** [resposta clara e objetiva ao que foi perguntado, em 3-6 linhas. Citar o patamar mais provável, a probabilidade e o timing baseados nos dados. Nada de hedges genéricos — seja específico.]"
+   Esse bloco é o mais importante da resposta. O usuário lê ele primeiro.
+18. ANÁLOGO S&P500 OBRIGATÓRIO em análises estruturais: Quando identificar o padrão atual do BTC, SEMPRE citar qual período do S&P500 (ou jovem 1950-1982 ou moderno) mais se assemelha. Especificar: ano, contexto, o que aconteceu depois, e por que é relevante para o BTC agora. Usar os dados injetados do ANÁLOGOS S&P500 se disponíveis.
+19. CORRELAÇÃO HISTÓRICA BTC OBRIGATÓRIA em análises de correção/bear: Sempre incluir seção comparando explicitamente com 2018 e 2022 (os dois bears mais documentados). Estrutura:
+   - 2018: O que era IGUAL ao hoje | O que era DIFERENTE | O que aconteceu depois
+   - 2022: O que era IGUAL ao hoje | O que era DIFERENTE | O que aconteceu depois
+   - CONCLUSÃO COMPARATIVA: o que esses dois cases ensinam para o momento atual
+   Nunca pular essa seção quando a pergunta envolver bear market, correção, fundo, ou análise de ciclo.
+20. NEUTRALIDADE ABSOLUTA — SEM BIAS: Apresentar dados como são, sem spin positivo ou negativo. Proibido usar "mas" para minimizar dados bearish em bear market. Proibido usar checkmarks (✅) em colunas de comparação para sugerir que o cenário atual é melhor sem dados que confirmem isso. Proibido concluir "recuperação" quando estamos em bear market confirmado.
+21. INTERPRETAÇÃO CORRETA DE ESTRUTURA CURTA EM BEAR MARKET: O campo trend_structure (HH_HL, LH_LL etc) do fingerprint descreve a estrutura LOCAL de 90 dias, NÃO o regime geral de mercado. Em um BEAR MARKET CONFIRMADO pela EMA50 semanal, qualquer HH_HL de curto prazo = dead cat bounce / armadilha de bear. NUNCA interprete HH_HL como "recuperação bullish" ou "correção em bull market" quando bear_status_btc mostra BEAR MARKET CONFIRMADO. O regime macro (EMA50 semanal) SEMPRE prevalece sobre a estrutura local de 90 dias.
+22. ANALOGOS INVÁLIDOS EM BEAR MARKET: Quando bear_status_btc = BEAR MARKET CONFIRMADO, os seguintes análogos são INVÁLIDOS e devem ser descartados: (a) COVID crash de mar/2020 — foi um crash de liquidez de 24h em pleno bull market, BTC ficou abaixo do ATH por menos de 7 dias; (b) qualquer período onde o BTC estava a menos de 20% do ATH; (c) qualquer período de bull market (EMA50 semanal acima). Usar SOMENTE análogos de outros bear markets confirmados (BTC -40% a -85% do ATH por 2+ meses).
+23. DIVERGÊNCIA BTC vs S&P500 OBRIGATÓRIA: Se o bloco "DIVERGENCIA BTC vs S&P500" mostrar divergência >15pp, isso é o sinal mais importante da análise. Significa que BTC está em fraqueza específica — NÃO é uma correção de mercado amplo. Nesse contexto, análogos históricos onde o mercado amplo também caiu (2018, 2022) são menos relevantes que análogos onde apenas o BTC caiu com o macro positivo.
+24. ANÁLOGOS VÊM DO PATTERN ENGINE — PROIBIDO INVENTAR ANO: O bloco "RECONHECIMENTO DE PADROES ESTRUTURAIS" já calculou os análogos reais do BTC com DATAS REAIS (ex.: "2018-09") e o "PADRAO REAL MAIS SEMELHANTE". Cite SOMENTE os períodos que aparecem nesse bloco. Se um ano NÃO está na saída do engine, está PROIBIDO citá-lo como análogo do BTC. Nunca diga "set/2017" ou "mar/2015" se a engine não listou — isso é alucinação. Comece a análise pelo PADRAO REAL MAIS SEMELHANTE (maior score).
+25. FALSA RUPTURA + RECLAIM → 2018: Se o fingerprint mostrar "FALSA RUPTURA + RECLAIM: SIM", isso é a assinatura do padrão de $6k em 2018 (rompeu o suporte de leve e voltou). Compare EXPLICITAMENTE com 2018: o que aconteceu (algumas falsas rupturas reverteram, mas a ruptura final com volume alto confirmou o breakdown para $3.1k). Diga o que diferencia reclaim (volume baixo no furo) de breakdown real (volume alto).
+26. CROSS-MARKET LIBERADO (S&P500 + Ouro 1970s + NASDAQ jovem): Para achar "situações parecidas em outros mercados", use os ANALOGOS CROSS-MARKET S&P500 do engine (datas reais) E pode citar os ciclos de Ouro 1971-1980 e NASDAQ jovem do contexto narrativo QUANDO a estrutura gráfica for parecida (não precisa ser bear — pode ser qualquer regime, desde que a forma case). Sempre priorize o de MAIOR semelhança estrutural. O objetivo é achar o gráfico mais parecido possível com o cenário atual do BTC.{fb}"""
 
 # ── send_message ─────────────────────────────────────────────────────────────
 
@@ -846,28 +945,32 @@ for i, q in enumerate(perguntas):
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-    if msg["role"] == "assistant" and i == len(st.session_state.messages) - 1:
+
+# Feedback discreto — aparece ABAIXO do chat, em expander fechado por padrão
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
+    last_i = len(st.session_state.messages) - 1
+    with st.expander("📝 Avaliar última resposta", expanded=False):
         ca, cb = st.columns([1, 1])
-        if ca.button("✓ Acertou", key=f"ok{i}"):
-            uq = st.session_state.messages[i-1]["content"][:80] if i > 0 else ""
+        if ca.button("✓ Acertou", key=f"ok{last_i}"):
+            uq = st.session_state.messages[last_i-1]["content"][:80] if last_i > 0 else ""
             st.session_state.feedbacks.append({
                 "date": datetime.now().strftime("%d/%m/%Y"),
                 "query": uq, "result": "correct", "note": "confirmado"
             })
             save_feedbacks()
             st.success("Registrado!")
-        if cb.button("✗ Errou", key=f"no{i}"):
-            st.session_state[f"fb{i}"] = True
-        if st.session_state.get(f"fb{i}"):
-            note = st.text_input("O que aconteceu diferente?", key=f"note{i}")
-            if st.button("Salvar", key=f"sv{i}"):
-                uq = st.session_state.messages[i-1]["content"][:80] if i > 0 else ""
+        if cb.button("✗ Errou", key=f"no{last_i}"):
+            st.session_state[f"fb{last_i}"] = True
+        if st.session_state.get(f"fb{last_i}"):
+            note = st.text_input("O que aconteceu diferente?", key=f"note{last_i}")
+            if st.button("Salvar feedback", key=f"sv{last_i}"):
+                uq = st.session_state.messages[last_i-1]["content"][:80] if last_i > 0 else ""
                 st.session_state.feedbacks.append({
                     "date": datetime.now().strftime("%d/%m/%Y"),
                     "query": uq, "result": "wrong", "note": note or "sem detalhe"
                 })
                 save_feedbacks()
-                st.session_state[f"fb{i}"] = False
+                st.session_state[f"fb{last_i}"] = False
 
 if st.session_state.feedbacks:
     with st.expander(f"🧠 Memória — {len(st.session_state.feedbacks)} feedbacks"):
@@ -910,7 +1013,6 @@ if final_prompt:
                 if ema50_btc and ema200_btc and rsi_btc:
                     pct_e50  = (price_btc - ema50_btc)  / ema50_btc  * 100
                     pct_e200 = (price_btc - ema200_btc) / ema200_btc * 100
-                    # Distância do preço BTC ao alvo (para level analog)
                     dist_to_target = None
                     if level_target:
                         dist_to_target = (level_target - price_btc) / price_btc * 100
@@ -919,6 +1021,37 @@ if final_prompt:
                         pct_e50, pct_e200, rsi_btc, vol30_btc,
                         btc_dist_to_target=dist_to_target
                     )
+
+            # ── Divergência BTC vs S&P500 (cálculo direto — injeta no topo do ctx) ──
+            btc_dist_ath = ind.get("dist_ath", 0)
+            if sp500_closes and len(sp500_closes) >= 252:
+                sp500_price_now = sp500_closes[-1]
+                sp500_ath_1y    = max(sp500_closes[-252:])
+                sp500_dd_1y     = round((sp500_price_now - sp500_ath_1y) / sp500_ath_1y * 100, 1)
+                divergence_pp   = round(abs(btc_dist_ath) - abs(sp500_dd_1y), 1)
+
+                if divergence_pp > 15:
+                    div_signal = "SINAL FORTEMENTE BEARISH PARA BTC"
+                elif divergence_pp > 5:
+                    div_signal = "SINAL BEARISH — BTC fraco relativo"
+                else:
+                    div_signal = "Mercados correlacionados"
+
+                div_block = (
+                    "\n"
+                    "================================================================\n"
+                    "DIVERGENCIA BTC vs S&P500 (dado calculado — nao ignorar)\n"
+                    "================================================================\n"
+                    f"  BTC distancia do ATH:        {btc_dist_ath}%\n"
+                    f"  S&P500 distancia do ATH 1a:  {sp500_dd_1y}%\n"
+                    f"  Divergencia BTC-SP500:        -{divergence_pp} pp\n"
+                    f"  Interpretacao: {div_signal}\n"
+                    "  REGRA: Se S&P500 esta perto da maxima mas BTC despencha,\n"
+                    "  isso NAO e correcao de mercado amplo — e fraqueza especifica\n"
+                    "  do BTC. Sinal historicamente bearish para BTC no curto prazo.\n"
+                    "================================================================\n"
+                )
+                sp500_ctx = div_block + sp500_ctx
         except Exception:
             sp500_ctx = ""
 
@@ -927,6 +1060,13 @@ if final_prompt:
     try:
         btc_closes_raw = ind.get("_closes", [])
         btc_vols_raw   = ind.get("_vols", [])
+        btc_ts_raw     = ind.get("_timestamps", [])
+        # Regime atual derivado do status calculado em get_indicators
+        regime = None
+        if ind.get("weeks_below_e50w", 0) >= 2:
+            regime = "bear"
+        elif ind.get("weeks_above_e50w", 0) >= 2:
+            regime = "bull"
         if len(btc_closes_raw) >= 180:
             pattern_ctx = build_pattern_context(
                 btc_closes_raw, btc_vols_raw,
@@ -934,6 +1074,8 @@ if final_prompt:
                 sp500_timestamps if sp500_timestamps else None,
                 window_btc=90,
                 window_sp500=13,   # 13 semanas ≈ 90 dias
+                btc_timestamps=btc_ts_raw if btc_ts_raw else None,
+                regime=regime,
             )
     except Exception:
         pattern_ctx = ""

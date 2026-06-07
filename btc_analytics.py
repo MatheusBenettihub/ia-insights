@@ -282,6 +282,9 @@ def similar_structure_finder(closes):
     # Death/Golden cross atual
     cross_now = 1 if e50_now > e200_now else -1
 
+    # Pré-computa RSI (só para exibição — não é critério de filtro)
+    rsi_all = _rsi_series(closes, 14)
+
     matches = []
     for i in range(200, n - 91):
         e50_i  = ema50_all[i]
@@ -292,7 +295,7 @@ def similar_structure_finder(closes):
         p_i = closes[i]
 
         # ATH do ciclo no ponto i (últimos 2 anos a partir de i)
-        lb_i = min(i, 730)
+        lb_i  = min(i, 730)
         ath_i = max(closes[i - lb_i: i + 1])
         pct_ath_i = (p_i - ath_i) / ath_i * 100
 
@@ -307,7 +310,6 @@ def similar_structure_finder(closes):
         if abs(pp_e50_i - pct_vs_e50) > 10:
             continue
 
-        # Bônus: mesmo tipo de cross (death/golden) — não é filtro rígido, só afeta agrupamento
         same_cross = cross_i == cross_now
 
         fwd30 = perf_from(closes, i, 30)
@@ -319,6 +321,7 @@ def similar_structure_finder(closes):
                 "preco":       round(p_i, 0),
                 "pct_ath":     round(pct_ath_i, 1),
                 "pct_e50":     round(pp_e50_i, 1),
+                "rsi":         round(rsi_all[i], 1) if rsi_all[i] is not None else None,
                 "same_cross":  same_cross,
                 "fwd30":       fwd30,
                 "fwd60":       fwd60,
@@ -598,7 +601,8 @@ def build_analytics_context(closes, vols):
     ssf_lines = []
     if ssf.get("analogos_encontrados"):
         k = ssf["analogos_encontrados"]
-        ssf_lines.append(f"  Análogos históricos encontrados (RSI±15pt, pos. MA±8%): {k} casos")
+        criterio = ssf.get("criterio", "distância ATH ±15pp + EMA50 ±10pp")
+        ssf_lines.append(f"  Análogos encontrados ({criterio}): {k} casos")
         if ssf.get("media_30d") is not None:
             ssf_lines.append(
                 f"  Retorno médio 30d: {ssf['media_30d']}% | "
@@ -615,9 +619,11 @@ def build_analytics_context(closes, vols):
                 f"  Retorno médio 90d: {ssf['media_90d']}% | positivo: {ssf['positivo_90d_pct']}%"
             )
         for a in ssf.get("ultimos_3_analogos", []):
+            rsi_str = f"RSI {a['rsi']}" if a.get('rsi') is not None else ""
             ssf_lines.append(
-                f"  → {a['dias_atras']}d atrás | preço ${a['preco']:,.0f} | RSI {a['rsi']} "
-                f"| retorno real: 30d={a['fwd30']}% 60d={a.get('fwd60','?')}% 90d={a.get('fwd90','?')}%"
+                f"  → {a['dias_atras']}d atrás | ${a['preco']:,.0f} | "
+                f"ATH dist: {a.get('pct_ath','?')}% | {rsi_str} "
+                f"| 30d={a['fwd30']}% 60d={a.get('fwd60','?')}% 90d={a.get('fwd90','?')}%"
             )
 
     # ── Monta bloco final ─────────────────────────────────────────────────────

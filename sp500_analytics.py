@@ -449,7 +449,7 @@ def build_sp500_context(sp500_closes, sp500_timestamps,
     if cur:
         lines += [
             "SITUAÇÃO ATUAL DO S&P500:",
-            f"  Preço: {cur['price']:,.2f} | RSI 14d: {cur['rsi']} | {cur.get('cross','N/A')}",
+            f"  Preço: {cur['price']:,.2f} | RSI 14d: {cur.get('rsi','N/A')} | {cur.get('cross','N/A')}",
             f"  Distância do ATH 1 ano: {cur['dd_1y_ath']}%",
             f"  Performance: 30d={cur['perf_30d']}% | 90d={cur['perf_90d']}% | 365d={cur['perf_365d']}%",
             f"  Volatilidade 30d: {cur['vol_30d']}% (BTC costuma ser 3-5x maior)",
@@ -481,7 +481,7 @@ def build_sp500_context(sp500_closes, sp500_timestamps,
                 lines.append("  Exemplos (S&P500 % real):")
                 for ex in j["exemplos"]:
                     lines.append(
-                        f"    {ex['data']} | RSI {ex['rsi']} | pos EMA50: {ex['pp_ema50']}% "
+                        f"    {ex['data']} | RSI {ex.get('rsi','N/A')} | pos EMA50: {ex.get('pp_ema50','?')}% "
                         f"→ 30d: {ex['fwd30']}% | 90d: {ex.get('fwd90','?')}%"
                     )
             lines.append("")
@@ -499,7 +499,7 @@ def build_sp500_context(sp500_closes, sp500_timestamps,
                 lines.append("  Exemplos recentes (S&P500 % real):")
                 for ex in m["exemplos"][-2:]:
                     lines.append(
-                        f"    {ex['data']} | RSI {ex['rsi']} | pos EMA50: {ex['pp_ema50']}% "
+                        f"    {ex['data']} | RSI {ex.get('rsi','N/A')} | pos EMA50: {ex.get('pp_ema50','?')}% "
                         f"→ 30d: {ex['fwd30']}% | 90d: {ex.get('fwd90','?')}%"
                     )
             lines.append("")
@@ -534,7 +534,7 @@ def build_sp500_context(sp500_closes, sp500_timestamps,
                 for ex in lj["exemplos"]:
                     hit = "ROMPEU" if ex.get("hit_30") else "nao rompeu"
                     lines.append(
-                        f"      {ex['data']} | RSI {ex['rsi']} | dist {ex['dist_sp500']}% "
+                        f"      {ex['data']} | RSI {ex.get('rsi','N/A')} | dist {ex.get('dist_sp500','?')}% "
                         f"→ 30d: {ex.get('ret_30','?')}% ({hit})"
                     )
             lines.append("")

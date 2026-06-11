@@ -6,13 +6,22 @@ Lógica:
   1. compute_fingerprint(closes, vols, window) — "tira um print" do mercado atual:
      range, posição no range, tempo lateral, testes de suporte, RSI, MAs, fase
   2. scan_analogues(closes, current_fp, window) — desliza a janela por todo o histórico,
-     pontua cada período por similaridade ao fingerprint atual, retorna os melhores matches
+     pontua cada período e retorna os melhores matches. O score combina dois canais:
+       - ESTRUTURA: similarity_score sobre o fingerprint (estado/foto do momento)
+       - TRAJETÓRIA: _shape_score sobre a FORMA do gráfico (o desenho esquerda→direita,
+         na ordem, com a escala de preço removida) — ver _shape_vector/_shape_score
   3. NAMED_PATTERNS_BTC — biblioteca de padrões históricos nomeados com descrição + fingerprint
   4. identify_named_pattern(fp) — qual padrão nomeado mais se parece com o estado atual
   5. build_pattern_context(btc_closes, btc_vols, sp500_closes, sp500_ts) — monta o bloco para o prompt
 """
 
+import math
 from datetime import datetime, timezone, timedelta
+
+# Carimbo de versão — exibido na UI p/ confirmar que o módulo novo foi carregado.
+# (Streamlit NÃO recarrega módulos importados; se a UI mostrar versão antiga,
+#  o processo precisa ser reiniciado: Ctrl+C e `streamlit run app.py`.)
+PATTERN_ENGINE_VERSION = "v4.1 — estrutura de PIVÔS + diversidade de episódio + janelas longas"
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -50,6 +59,119 @@ def _find_local_extremes(data, w=10):
         if data[i] == max(seg): tops.append((i, data[i]))
         elif data[i] == min(seg): bottoms.append((i, data[i]))
     return tops, bottoms
+
+
+# ── Trajetória / FORMA do gráfico (o "print" lido da esquerda p/ direita, em ordem) ──
+# Diferente do fingerprint (que é uma FOTO de números do momento), isto compara o
+# DESENHO inteiro da curva, na ordem temporal, ignorando a escala de preço.
+
+def _resample(seq, m):
+    """Reamostra `seq` para exatamente `m` pontos (interpolação linear). Preserva a ORDEM
+    esquerda→direita — permite comparar janelas de durações diferentes."""
+    n = len(seq)
+    if n == 0:
+        return [0.0] * m
+    if n == m:
+        return list(seq)
+    out = []
+    for j in range(m):
+        x = j * (n - 1) / (m - 1) if m > 1 else 0.0
+        i0 = int(x)
+        i1 = min(i0 + 1, n - 1)
+        frac = x - i0
+        out.append(seq[i0] * (1 - frac) + seq[i1] * frac)
+    return out
+
+def _shape_vector(seg, m=48):
+    """
+    Converte um trecho de preços na sua FORMA pura (magnitude removida):
+      1. log dos preços (o que importa é o movimento %, não o valor absoluto)
+      2. reamostra para m pontos (compara janelas de durações diferentes)
+      3. normaliza min-max p/ [0,1] — um -60% e um -30% com o MESMO desenho viram a MESMA curva
+    Retorna o vetor da forma, na ordem esquerda→direita.
+    """
+    if not seg or len(seg) < 2:
+        return None
+    logs = [math.log(v) if v > 0 else 0.0 for v in seg]
+    rs = _resample(logs, m)
+    lo, hi = min(rs), max(rs)
+    if hi - lo < 1e-9:
+        return [0.5] * m
+    return [(v - lo) / (hi - lo) for v in rs]
+
+def _shape_score(vec_a, vec_b):
+    """
+    Score 0-100 de quão parecido é o DESENHO de duas trajetórias já normalizadas.
+    Combina erro ponto-a-ponto (o nível da curva em cada x) com correlação (o
+    co-movimento na ordem: sobe quando o outro sobe, desce quando desce).
+    """
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    m = len(vec_a)
+    # Erro médio absoluto sobre [0,1] — quão alinhadas estão as curvas ponto a ponto
+    mae = sum(abs(a - b) for a, b in zip(vec_a, vec_b)) / m
+    err_score = max(0.0, 1 - mae / 0.35)            # 0.35 = tolerância de forma
+    # Correlação de Pearson — direção do movimento na ordem temporal
+    ma = sum(vec_a) / m
+    mb = sum(vec_b) / m
+    cov = sum((a - ma) * (b - mb) for a, b in zip(vec_a, vec_b))
+    va = math.sqrt(sum((a - ma) ** 2 for a in vec_a))
+    vb = math.sqrt(sum((b - mb) ** 2 for b in vec_b))
+    corr = cov / (va * vb) if va > 1e-9 and vb > 1e-9 else 0.0
+    corr_score = max(0.0, corr)                     # só co-movimento positivo conta
+    return round((0.55 * err_score + 0.45 * corr_score) * 100, 1)
+
+
+# ── ESTRUTURA DE PIVÔS (zigzag) — o jeito CERTO de casar padrão gráfico ──────
+# Em vez de borrar a curva inteira, identifica os topos/fundos de swing (pivôs) e
+# codifica a SEQUÊNCIA de pernas (cada movimento, com direção e tamanho). Assim
+# "fez fundo → repicou → rompeu o fundo → voltou" casa entre eras e escalas
+# diferentes, que é como um trader lê o gráfico. (Validado: agora ↔ nov/2018.)
+
+def _zigzag(seg, thr=0.10):
+    """Pivôs de swing por reversão de `thr` (ex.: 10%). Retorna [(idx, preço, tipo)]
+    alternando 'H'/'L', terminando no ponto atual 'C'. Preserva a ordem temporal."""
+    if len(seg) < 3:
+        return []
+    piv = []
+    ext_i, ext_p, direc = 0, seg[0], 0
+    for i in range(1, len(seg)):
+        p = seg[i]
+        if direc >= 0 and p > ext_p:
+            ext_p, ext_i = p, i; direc = 1
+        elif direc <= 0 and p < ext_p:
+            ext_p, ext_i = p, i; direc = -1
+        if direc == 1 and p <= ext_p * (1 - thr):
+            piv.append((ext_i, ext_p, 'H')); ext_p, ext_i = p, i; direc = -1
+        elif direc == -1 and p >= ext_p * (1 + thr):
+            piv.append((ext_i, ext_p, 'L')); ext_p, ext_i = p, i; direc = 1
+    piv.append((len(seg) - 1, seg[-1], 'C'))
+    return piv
+
+def _struct_legs(seg, thr=0.10, k=5):
+    """Sequência das últimas `k` PERNAS = log-retorno entre pivôs consecutivos.
+    Direção (sinal) + magnitude do movimento. É a 'assinatura estrutural' da janela."""
+    piv = _zigzag(seg, thr)
+    if len(piv) < 3:
+        return None
+    legs = [math.log(piv[j][1] / piv[j - 1][1]) for j in range(1, len(piv))
+            if piv[j - 1][1] > 0 and piv[j][1] > 0]
+    return legs[-k:] if len(legs) >= 2 else None
+
+def _leg_similarity(a, b):
+    """Score 0-100 entre duas sequências de pernas. Compara magnitude+direção das
+    pernas (erro relativo) e recompensa pernas no MESMO sentido, na ordem."""
+    if not a or not b:
+        return 0.0
+    k = min(len(a), len(b))
+    if k < 2:
+        return 0.0
+    a, b = a[-k:], b[-k:]
+    num = sum(abs(x - y) for x, y in zip(a, b))
+    den = sum(abs(x) + abs(y) for x, y in zip(a, b)) + 1e-9
+    mag_score = max(0.0, 1 - num / den)              # pernas do mesmo tamanho/direção
+    sign = sum(1 for x, y in zip(a, b) if (x > 0) == (y > 0)) / k
+    return round((0.6 * mag_score + 0.4 * sign) * 100, 1)
 
 
 # ── 1. Fingerprint estrutural ────────────────────────────────────────────────
@@ -236,16 +358,21 @@ def _classify_phase(price, high, low, dst, dsb, trend, rsi, pct_e50, pct_e200, p
 # ── 2. Score de similaridade entre dois fingerprints ────────────────────────
 
 WEIGHTS = {
-    # Dimensões estruturais — o que realmente distingue bull de bear de acumulação
-    "pct_from_cycle_ath":        0.28,  # ← mais importante: 50% abaixo ATH = bear, 5% = topo
-    "days_since_cycle_ath_norm": 0.15,  # tempo desde o topo do ciclo
-    "position_in_range":         0.15,  # onde no range da janela
-    "pct_vs_ema50":              0.10,  # relação com EMA50
-    "range_pct_norm":            0.10,  # amplitude do range (ajustada por escala)
-    "consecutive_lower_highs":   0.08,  # estrutura de topos — bear clássico
-    "support_tests":             0.07,  # quantas vezes testou o fundo
-    "days_since_top_ratio":      0.04,
-    "days_since_bottom_ratio":   0.03,
+    # ESTRUTURA e CENÁRIO acima de tudo. A % de queda do ATH pesa POUCO: o mercado
+    # era muito menor e mais volátil no passado (um -60% de 2018 ≈ um -30% de hoje).
+    # O que de fato repete entre eras é a SEQUÊNCIA estrutural:
+    # bear → fundo → reclaim de média → furo do fundo → recuperação → média seguinte.
+    "trend_structure":           0.16,  # ← formato: HH_HL (bull) / LH_LL (bear) / acumulação
+    "position_in_range":         0.14,  # onde no range (fundo? meio? topo?)
+    "pct_vs_ema50":              0.12,  # relação com a média (reclaim/rejeição)
+    "support_tests":             0.12,  # quantas vezes testou/segurou o fundo
+    "consecutive_lower_highs":   0.10,  # estrutura de topos
+    "pct_vs_ema200":             0.06,  # relação com a média longa
+    "days_since_top_ratio":      0.05,  # sequência temporal do movimento
+    "days_since_bottom_ratio":   0.05,
+    "pct_from_cycle_ath":        0.10,  # ← peso baixo: profundidade importa pouco
+    "days_since_cycle_ath_norm": 0.05,  # tempo desde o topo do ciclo
+    "range_pct_norm":            0.05,  # amplitude (volatilidade varia por era)
     # RSI: peso ZERO no scoring — aparece igual em bull e bear, é lagging
     # (mantido no fingerprint só para a IA ler, não para comparar)
 }
@@ -266,49 +393,45 @@ def similarity_score(fp_a, fp_b, scale_range=1.0):
         diff = abs(a - b)
         return min(diff / tolerance, 1.0)
 
+    # scaled(): ajusta a MAGNITUDE do candidato p/ cross-market (BTC vs S&P500).
+    # Ex.: um -50% do BTC equivale a ~-14% do S&P (×3.5). Para BTC-BTC scale=1.0 (sem efeito).
+    def scaled(v):
+        return v * scale_range if v is not None else None
+
+    def trend_pen(a, b):
+        """Penalidade categórica de estrutura de topos/fundos (o formato gráfico)."""
+        if a is None or b is None:
+            return 0.5
+        if a == b:
+            return 0.0
+        if "lateral" in (a, b):   # lateral é transição — meia penalidade
+            return 0.5
+        return 1.0
+
     penalties = {}
 
-    # 1. % abaixo do ATH do ciclo — CRITÉRIO PRINCIPAL
-    # Tolerância ±12pp: 50% abaixo ATH não pode casar com 5% abaixo ATH
-    penalties["pct_from_cycle_ath"] = pnorm(
-        fp_a.get("pct_from_cycle_ath"), fp_b.get("pct_from_cycle_ath"), 12
+    # ── ESTRUTURA / CENÁRIO (peso alto) — o que de fato repete entre eras ───────
+    # Estrutura de topos/fundos: o formato (bear LH_LL, acumulação LH_HL, bull HH_HL)
+    penalties["trend_structure"] = trend_pen(
+        fp_a.get("trend_structure"), fp_b.get("trend_structure")
     )
-
-    # 2. Tempo desde o ATH do ciclo — já em ANOS (unidade comum entre timeframes).
-    # Tolerância 0.4 ano (~5 meses). Fallback p/ dias/365 se years ausente.
-    w = fp_a.get("window", 90)
-    ath_yr_a = fp_a.get("years_since_cycle_ath")
-    ath_yr_b = fp_b.get("years_since_cycle_ath")
-    if ath_yr_a is None:
-        ath_yr_a = (fp_a.get("days_since_cycle_ath") or 0) / 365.0
-    if ath_yr_b is None:
-        ath_yr_b = (fp_b.get("days_since_cycle_ath") or 0) / 365.0
-    penalties["days_since_cycle_ath_norm"] = pnorm(ath_yr_a, ath_yr_b, 0.4)
-
-    # 3. Posição no range da janela
+    # Posição no range (fundo / meio / topo da janela)
     penalties["position_in_range"] = pnorm(
         fp_a.get("position_in_range"), fp_b.get("position_in_range"), 18
     )
-
-    # 4. Posição vs EMA50
-    penalties["pct_vs_ema50"] = pnorm(fp_a.get("pct_vs_ema50"), fp_b.get("pct_vs_ema50"), 10)
-
-    # 5. Range normalizado (amplitude)
-    rng_a = fp_a.get("range_pct") or 0
-    rng_b = (fp_b.get("range_pct") or 0) * scale_range
-    penalties["range_pct_norm"] = pnorm(rng_a, rng_b, 25)
-
-    # 6. Topos consecutivos mais baixos (estrutura bear/bull)
-    penalties["consecutive_lower_highs"] = pnorm(
-        fp_a.get("consecutive_lower_highs"), fp_b.get("consecutive_lower_highs"), 2
-    )
-
-    # 7. Testes de suporte
+    # Relação com as médias (reclaim/rejeição da EMA50/EMA200) — escalada p/ cross-market
+    penalties["pct_vs_ema50"]  = pnorm(fp_a.get("pct_vs_ema50"),  scaled(fp_b.get("pct_vs_ema50")),  12)
+    penalties["pct_vs_ema200"] = pnorm(fp_a.get("pct_vs_ema200"), scaled(fp_b.get("pct_vs_ema200")), 14)
+    # Testes de suporte — quantas vezes segurou/furou o fundo
     penalties["support_tests"] = pnorm(
         fp_a.get("support_tests"), fp_b.get("support_tests"), 4
     )
-
-    # 8. Dias desde topo/fundo (ratio da janela)
+    # Topos consecutivos mais baixos (estrutura bear/bull)
+    penalties["consecutive_lower_highs"] = pnorm(
+        fp_a.get("consecutive_lower_highs"), fp_b.get("consecutive_lower_highs"), 2
+    )
+    # Dias desde topo/fundo (ratio da janela) — sequência temporal do movimento
+    w = fp_a.get("window", 90)
     rat_top_a = (fp_a.get("days_since_top") or 0)    / w
     rat_top_b = (fp_b.get("days_since_top") or 0)    / fp_b.get("window", w)
     rat_bot_a = (fp_a.get("days_since_bottom") or 0) / w
@@ -316,16 +439,33 @@ def similarity_score(fp_a, fp_b, scale_range=1.0):
     penalties["days_since_top_ratio"]    = pnorm(rat_top_a, rat_top_b, 0.25)
     penalties["days_since_bottom_ratio"] = pnorm(rat_bot_a, rat_bot_b, 0.25)
 
+    # ── CONTEXTO (peso baixo) — magnitude/profundidade importa pouco ────────────
+    # % abaixo do ATH do ciclo — magnitude escalada p/ cross-market, tolerância larga
+    penalties["pct_from_cycle_ath"] = pnorm(
+        fp_a.get("pct_from_cycle_ath"), scaled(fp_b.get("pct_from_cycle_ath")), 25
+    )
+    # Tempo desde o ATH do ciclo — em ANOS (unidade comum entre timeframes)
+    ath_yr_a = fp_a.get("years_since_cycle_ath")
+    ath_yr_b = fp_b.get("years_since_cycle_ath")
+    if ath_yr_a is None:
+        ath_yr_a = (fp_a.get("days_since_cycle_ath") or 0) / 365.0
+    if ath_yr_b is None:
+        ath_yr_b = (fp_b.get("days_since_cycle_ath") or 0) / 365.0
+    penalties["days_since_cycle_ath_norm"] = pnorm(ath_yr_a, ath_yr_b, 0.4)
+    # Range normalizado (amplitude) — volatilidade varia por era, peso baixo
+    rng_a = fp_a.get("range_pct") or 0
+    rng_b = (fp_b.get("range_pct") or 0) * scale_range
+    penalties["range_pct_norm"] = pnorm(rng_a, rng_b, 25)
+
     # RSI: NÃO entra no scoring — é lagging e aparece igual em contextos opostos
-    # (mantido no fingerprint só para leitura, não para comparação)
 
     total_penalty = sum(WEIGHTS[k] * penalties[k] for k in WEIGHTS)
     score = (1 - total_penalty) * 100
 
-    # Bônus de forma: mesma assinatura de "falsa ruptura + reclaim" (spring/2018).
-    # +6 pts quando ambos compartilham o padrão — reforça semelhança gráfica.
+    # Bônus de forma: mesma assinatura "furou o fundo e recuperou" (spring/2018).
+    # +12 pts — é exatamente o tipo de CENÁRIO que define semelhança estrutural.
     if fp_a.get("false_breakdown_reclaim") and fp_b.get("false_breakdown_reclaim"):
-        score += 6
+        score += 12
 
     return max(round(score, 1), 0.0)
 
@@ -334,7 +474,8 @@ def similarity_score(fp_a, fp_b, scale_range=1.0):
 
 def scan_analogues(closes, current_fp, vols=None, timestamps=None,
                    window=90, top_n=5, scale_range=1.0, min_score=55.0,
-                   bars_per_year=365, regime_filter=None):
+                   bars_per_year=365, regime_filter=None,
+                   current_struct=None, shape_weight=0.0, exclude_recent=0):
     """
     Desliza a janela de `window` candles por todo o histórico de `closes`,
     computa o fingerprint de cada janela e pontua a similaridade com `current_fp`.
@@ -344,6 +485,13 @@ def scan_analogues(closes, current_fp, vols=None, timestamps=None,
     bars_per_year: 365 (diário) ou 52 (semanal) — passado ao fingerprint.
     regime_filter: "bear" → só mantém janelas estruturalmente bear
                    (pct_from_cycle_ath <= -35 e death cross). None = liberal.
+    current_struct: sequência de PERNAS atual (de _struct_legs). Se dada e shape_weight>0,
+                   o score final combina ESTRUTURA DE PIVÔS (o padrão gráfico real) +
+                   fingerprint. É o canal que casa "fundo→repique→furo→reclaim".
+    shape_weight:  0..1 — quanto a estrutura de pivôs pesa no score (vs fingerprint).
+    exclude_recent: nº de candles ao FINAL a ignorar — evita casar o presente com o
+                   passado RECENTE do MESMO ciclo (ex.: comparar o bear de agora com
+                   ele mesmo 4 meses atrás, o que não prevê nada). Só p/ self-scan.
     """
     n = len(closes)
     if n < window + 90:
@@ -352,9 +500,12 @@ def scan_analogues(closes, current_fp, vols=None, timestamps=None,
     # Janela de histórico passada ao fingerprint: o bastante p/ ATH de ciclo (2 anos)
     # + EMA200. LIMITADA para o scan ser O(n) e não O(n²) (senão trava o app).
     hist_window = int(2 * bars_per_year) + window + 10
+    last_allowed = n - 1 - exclude_recent      # índice máximo permitido p/ um match
 
     results = []
     for i in range(window, n - 30):
+        if exclude_recent and i > last_allowed:
+            continue
         seg  = closes[i - window: i + 1]
         vseg = vols[i - window: i + 1] if vols and len(vols) > i else None
         lo   = max(0, i + 1 - hist_window)
@@ -371,8 +522,28 @@ def scan_analogues(closes, current_fp, vols=None, timestamps=None,
             pct_ath = fp_i.get("pct_from_cycle_ath")
             if pct_ath is None or pct_ath > -35 or fp_i.get("ma_cross") != -1:
                 continue
+            # RETROSPECTIVA: um bear ESTRUTURAL não se recupera para perto do ATH
+            # logo depois. Correções dentro de bull (ex.: jul/2021 caiu -54% e fez novo
+            # ATH em ~3 meses) são FALSOS bears — descarta olhando o que veio depois.
+            lookback_ath = min(len(full_up_to_i), int(2 * bars_per_year))
+            cyc_ath_i = max(full_up_to_i[-lookback_ath:]) if lookback_ath else None
+            fwd_horizon = int(bars_per_year / 3)          # ~4 meses
+            fwd_max = max(closes[i: min(i + fwd_horizon, n)])
+            if cyc_ath_i and fwd_max >= cyc_ath_i * 0.85:  # voltou a -15% do ATH = era bull
+                continue
 
-        score = similarity_score(current_fp, fp_i, scale_range)
+        # FINGERPRINT pontual — o "estado/regime" do mercado (confirma contexto)
+        struct = similarity_score(current_fp, fp_i, scale_range)
+
+        # ESTRUTURA DE PIVÔS — o padrão gráfico real (pernas: fundo→repique→furo→...)
+        shape = None
+        if shape_weight > 0 and current_struct:
+            legs_i = _struct_legs(seg)
+            shape = _leg_similarity(current_struct, legs_i)
+            score = round((1 - shape_weight) * struct + shape_weight * shape, 1)
+        else:
+            score = struct
+
         if score < min_score:
             continue
 
@@ -386,6 +557,8 @@ def scan_analogues(closes, current_fp, vols=None, timestamps=None,
 
         results.append({
             "score":    score,
+            "struct":   struct,
+            "shape":    shape,
             "idx":      i,
             "window":   window,
             "periodo":  _ts_to_ym(ts) if ts else f"candle {i}",
@@ -415,13 +588,23 @@ def scan_analogues_multiwindow(closes, vols=None, timestamps=None,
                                windows=(60, 90, 120, 180), top_n=5,
                                scale_range=1.0, min_score=55.0,
                                bars_per_year=365, regime_filter=None,
-                               current_fps=None):
+                               current_fps=None, current_segs=None,
+                               shape_weight=0.0, exclude_recent=0,
+                               min_separation=45):
     """
     Roda scan_analogues em várias janelas e mescla os resultados, priorizando o
     maior score — acha a forma gráfica mais parecida independente da duração exata.
 
-    current_fps: dict {window: fingerprint_atual_dessa_janela}. O fingerprint atual
-                 precisa ser calculado na MESMA janela de cada scan para casar a forma.
+    current_fps:  dict {window: fingerprint_atual_dessa_janela}. O fingerprint atual
+                  precisa ser calculado na MESMA janela de cada scan para casar a forma.
+    current_segs: dict {window: trecho_de_precos_atual} para a comparação de TRAJETÓRIA.
+                  Em self-scan (BTC vs BTC) usa os últimos `w` candles de `closes`.
+                  Em cross-market (BTC vs S&P500) passe o trecho do BTC aqui.
+    shape_weight: 0..1 — peso do desenho do gráfico (trajetória) no score final.
+    exclude_recent: candles ao final a ignorar (não casar o presente com o passado recente).
+    min_separation: candles mínimos entre dois análogos retornados — DIVERSIDADE DE
+                   EPISÓDIO. Evita o top-N virar 2-3 fatias do MESMO bear (ex.: 2022-05 e
+                   2022-08). Com ~180 (6 meses), cada análogo é um período distinto.
     """
     all_results = []
     for w in windows:
@@ -432,20 +615,26 @@ def scan_analogues_multiwindow(closes, vols=None, timestamps=None,
                                          bars_per_year=bars_per_year)
         if not cur_fp:
             continue
+        cur_seg = (current_segs or {}).get(w)
+        if cur_seg is None:
+            cur_seg = closes[-w:]            # self-scan: estrutura atual = últimos w candles
+        cur_struct = _struct_legs(cur_seg) if shape_weight > 0 else None
         res = scan_analogues(
             closes, cur_fp, vols=vols, timestamps=timestamps,
             window=w, top_n=top_n, scale_range=scale_range,
             min_score=min_score, bars_per_year=bars_per_year,
             regime_filter=regime_filter,
+            current_struct=cur_struct, shape_weight=shape_weight,
+            exclude_recent=exclude_recent,
         )
         all_results.extend(res)
 
-    # Dedup global por proximidade temporal, mantendo o maior score
+    # Dedup global por proximidade temporal (diversidade de episódio), maior score 1º
     all_results.sort(key=lambda x: -x["score"])
     merged = []
     used_idx = []
     for r in all_results:
-        if all(abs(r["idx"] - u) > 45 for u in used_idx):
+        if all(abs(r["idx"] - u) > min_separation for u in used_idx):
             merged.append(r)
             used_idx.append(r["idx"])
         if len(merged) >= top_n:
@@ -686,11 +875,16 @@ def build_pattern_context(btc_closes, btc_vols=None,
     named_match, named_score = identify_named_pattern(current_fp, regime_filter=regime)
 
     # ── Análogos BTC — scan MULTI-JANELA p/ máxima semelhança gráfica ──────────
-    btc_windows = (60, 90, 120, 180)
+    # Janelas curtas E longas: 90d capta o movimento recente; 270/365d capta o ARCO
+    # inteiro de um bear (ex.: 2018 levou ~12 meses — janela curta não enxerga o arco).
+    btc_windows = (90, 180, 270, 365)
     btc_analogues = scan_analogues_multiwindow(
         btc_closes, vols=btc_vols, timestamps=btc_timestamps,
-        windows=btc_windows, top_n=6, scale_range=1.0,
+        windows=btc_windows, top_n=3, scale_range=1.0,
         min_score=50.0, bars_per_year=365, regime_filter=regime,
+        shape_weight=0.65,   # trajetória (desenho do gráfico) domina, estrutura confirma
+        exclude_recent=270,  # ignora os últimos ~9 meses (não casar o bear atual consigo mesmo)
+        min_separation=180,  # diversidade: cada análogo é um episódio distinto (não 2x o mesmo bear)
     )
 
     # ── Análogos S&P500 — liberal (qualquer era/regime), timeframe semanal ─────
@@ -699,13 +893,18 @@ def build_pattern_context(btc_closes, btc_vols=None,
         sp_windows = (window_sp500, window_sp500 * 2, window_sp500 * 3)  # ~3m, 6m, 9m
         sp500_analogues = scan_analogues_multiwindow(
             sp500_closes, timestamps=sp500_timestamps,
-            windows=sp_windows, top_n=5, scale_range=3.5,
+            windows=sp_windows, top_n=3, scale_range=3.5,
             min_score=48.0, bars_per_year=52, regime_filter=None,
             current_fps={
                 w: compute_fingerprint(btc_closes, btc_vols, _btc_equiv_days(w),
                                        full_closes=btc_closes, bars_per_year=365)
                 for w in sp_windows
             },
+            # Trajetória é IDEAL p/ cross-market: a forma ignora a escala de preço,
+            # então o desenho do BTC casa direto com o do S&P (sem o hack de 3.5x).
+            current_segs={w: btc_closes[-_btc_equiv_days(w):] for w in sp_windows},
+            shape_weight=0.7,
+            min_separation=26,   # ~6 meses em semanas — episódios distintos no S&P
         )
 
     # ── Monta o bloco de texto ────────────────────────────────────────────────
@@ -747,8 +946,9 @@ def build_pattern_context(btc_closes, btc_vols=None,
     if btc_analogues:
         top = btc_analogues[0]
         fp_t = top["fp"]
+        _sh = f" (estrutura de pivos {top['shape']:.0f}/100 + fingerprint {top['struct']:.0f}/100)" if top.get("shape") is not None else ""
         lines += [
-            f"PADRAO REAL MAIS SEMELHANTE (BTC) — score {top['score']:.0f}/100:",
+            f"PADRAO REAL MAIS SEMELHANTE (BTC) — score {top['score']:.0f}/100{_sh}:",
             f"  Periodo: {top['periodo']} | janela {top['window']}d | fase={fp_t.get('phase','?')}",
             f"  Estrutura: pos={fp_t.get('position_in_range','?')}% ATHdist={fp_t.get('pct_from_cycle_ath','?')}% "
             f"falsa_ruptura={'SIM' if fp_t.get('false_breakdown_reclaim') else 'nao'}",
@@ -773,12 +973,13 @@ def build_pattern_context(btc_closes, btc_vols=None,
     if btc_analogues:
         lines += [
             f"ANALOGOS HISTORICOS BTC — TOP {len(btc_analogues)} MAIS SIMILARES (scan multi-janela):",
-            "  (Score = similaridade estrutural 0-100 sobre fingerprint real; datas reais)",
+            "  (Score = ESTRUTURA de pivos/pernas do grafico + fingerprint; ignora escala de preco; datas reais)",
         ]
         for a in btc_analogues:
             fp_a = a["fp"]
+            _sh = f"estrut={a['shape']:.0f} " if a.get("shape") is not None else ""
             lines.append(
-                f"  Score {a['score']:.0f}/100 | {a['periodo']} (jan {a['window']}d) | "
+                f"  Score {a['score']:.0f}/100 | {_sh}| {a['periodo']} (jan {a['window']}d) | "
                 f"fase={fp_a.get('phase','?')} pos={fp_a.get('position_in_range','?')}% "
                 f"ATHdist={fp_a.get('pct_from_cycle_ath','?')}% | "
                 f"retorno real: 30d={a['fwd30']}% 60d={a['fwd60']}% 90d={a['fwd90']}%"
@@ -802,14 +1003,15 @@ def build_pattern_context(btc_closes, btc_vols=None,
     # Análogos S&P500 (cross-market — sempre presente)
     if sp500_analogues:
         lines += [
-            f"ANALOGOS CROSS-MARKET S&P500 — TOP {len(sp500_analogues)} (escala ~3.5x, datas reais):",
-            "  Estrutura grafica parecida em OUTRO mercado. Multiplicar retorno por ~3.5x p/ equiv BTC.",
+            f"ANALOGOS CROSS-MARKET S&P500 — TOP {len(sp500_analogues)} (match por ESTRUTURA, datas reais):",
+            "  Mesma SEQUENCIA de pivos em OUTRO mercado (estrutura ignora escala). Multiplicar retorno por ~3.5x p/ equiv BTC.",
         ]
         for a in sp500_analogues:
             fp_a = a["fp"]
             era_label = "[ERA JOVEM <1983 - mais analogo ao BTC]" if a["era"] == "jovem" else "[moderno]"
+            _sh = f"estrut={a['shape']:.0f} " if a.get("shape") is not None else ""
             lines.append(
-                f"  Score {a['score']:.0f}/100 | {a['periodo']} (jan {a['window']}sem) {era_label} | "
+                f"  Score {a['score']:.0f}/100 | {_sh}| {a['periodo']} (jan {a['window']}sem) {era_label} | "
                 f"fase={fp_a.get('phase','?')} pos={fp_a.get('position_in_range','?')}% "
                 f"ATHdist={fp_a.get('pct_from_cycle_ath','?')}% | "
                 f"S&P500 real: 30sem={a['fwd30']}% 90sem={a['fwd90']}% "
@@ -840,7 +1042,9 @@ def build_pattern_context(btc_closes, btc_vols=None,
         "",
         "INSTRUCOES:",
         "  1. Use o FINGERPRINT ATUAL para descrever objetivamente a estrutura presente",
-        "  2. PRIORIZE o PADRAO REAL MAIS SEMELHANTE (maior score) — e o mais proximo do grafico atual",
+        "  2. PRIORIZE o PADRAO REAL MAIS SEMELHANTE (maior score). O score = ESTRUTURA DE PIVOS",
+        "     (a sequencia de pernas/swings do grafico, ignorando a escala de preco) + fingerprint.",
+        "     Descreva a SEQUENCIA que se repete: fundo -> repique -> furo do fundo -> reclaim -> etc.",
         "  3. Cite os ANALOGOS por DATA REAL (a engine ja calculou) — NUNCA invente anos",
         "  4. Em regime bear, so cite bear markets reais do BTC (2014/2018/2022)",
         "  5. Se FALSA RUPTURA + RECLAIM = SIM, compare explicitamente com o $6k de 2018",

@@ -250,12 +250,13 @@ def similar_structure_finder(closes):
     Varre TODO o histórico disponível e encontra períodos com estrutura
     ESTRUTURAL parecida com a atual.
 
-    Filtro principal: distância do ATH do ciclo (±15pp)
-    Filtro secundário: posição vs EMA50 (±10pp)
+    Filtro principal: REGIME (death/golden cross igual) — separa bear de bull.
+    Filtro secundário: distância do ATH (±45pp, banda larga) e EMA50 (±25pp).
     RSI: NÃO é usado como filtro — é lagging e aparece igual em bull e bear.
 
-    Isso garante que -50% do ATH só casa com outros períodos de -50% do ATH,
-    nunca com bull markets que acidentalmente tenham o mesmo RSI.
+    A profundidade da queda (% do ATH) pesa POUCO: o mercado era muito menor e mais
+    volátil no passado (um -68% de 2018 é o mesmo CENÁRIO que um -50% de hoje). O que
+    importa é o regime + a estrutura, então 2018/2014 (bears profundos) também casam.
     """
     if len(closes) < 250:
         return {}
@@ -302,15 +303,20 @@ def similar_structure_finder(closes):
         pp_e50_i = (p_i - e50_i) / e50_i * 100
         cross_i  = 1 if e50_i > e200_i else -1
 
-        # FILTRO PRIMÁRIO: distância do ATH ±15pp (separa bear de bull)
-        if abs(pct_ath_i - pct_from_ath_now) > 15:
+        # FILTRO SECUNDÁRIO: distância do ATH em banda LARGA ±45pp
+        # (profundidade importa pouco — deixa 2018/2014 casarem com -50% de hoje)
+        if abs(pct_ath_i - pct_from_ath_now) > 45:
             continue
 
-        # FILTRO SECUNDÁRIO: posição vs EMA50 ±10pp
-        if abs(pp_e50_i - pct_vs_e50) > 10:
+        # FILTRO TERCIÁRIO: posição vs EMA50 ±25pp (larga)
+        if abs(pp_e50_i - pct_vs_e50) > 25:
             continue
 
         same_cross = cross_i == cross_now
+
+        # FILTRO PRIMÁRIO: mesmo REGIME (death cross casa com death cross)
+        if not same_cross:
+            continue
 
         fwd30 = perf_from(closes, i, 30)
         fwd60 = perf_from(closes, i, 60)
@@ -341,7 +347,7 @@ def similar_structure_finder(closes):
 
     result = {
         "analogos_encontrados": len(primary),
-        "criterio":             f"ATH do ciclo ±15pp (atual: {round(pct_from_ath_now,1)}%), EMA50 ±10pp",
+        "criterio":             f"mesmo regime (cross) + ATH ±45pp (atual: {round(pct_from_ath_now,1)}%) + EMA50 ±25pp",
         "ultimos_3_analogos":   primary[-3:],
     }
     if fwd30s:

@@ -3,12 +3,31 @@ import requests
 import json
 import os
 import re
+import sys
 from datetime import datetime, date, timezone, timedelta
+
+# ── Hot-reload dos módulos locais ────────────────────────────────────────────
+# O Streamlit reexecuta o app.py a cada interação, MAS não reimporta módulos já
+# carregados (eles ficam em sys.modules). Isso fazia edições em pattern_engine.py /
+# btc_analytics.py NÃO terem efeito sem reiniciar o processo. Removê-los de
+# sys.modules aqui força o Python a reler os arquivos do disco a cada rerun.
+# (São módulos sem estado — só funções/constantes — então reler é seguro.)
+for _m in ("pattern_engine", "btc_analytics", "sp500_analytics",
+           "btc_context", "sp500_young_context"):
+    sys.modules.pop(_m, None)
+
 from btc_context import BTC_HISTORICAL_CONTEXT
 from btc_analytics import build_analytics_context, level_breakout_probability
 from sp500_young_context import SP500_YOUNG_MARKET_CONTEXT
 from sp500_analytics import fetch_sp500_history, build_sp500_context
+import pattern_engine
 from pattern_engine import build_pattern_context
+# getattr com fallback: se o Streamlit estiver com o módulo ANTIGO em cache (sem a
+# constante), não quebra com traceback — avisa na tela que precisa reiniciar o processo.
+PATTERN_ENGINE_VERSION = getattr(
+    pattern_engine, "PATTERN_ENGINE_VERSION",
+    "❌ módulo ANTIGO em cache — FECHE o terminal e rode 'streamlit run app.py' num terminal novo"
+)
 import time
 
 st.set_page_config(page_title="Agente BTC", page_icon="₿", layout="wide")
@@ -696,8 +715,9 @@ REGRA: Nunca cite valores de médias que não estejam listados acima."""
             ind.get("_closes", []),
             ind.get("_vols", [])
         )
-    except Exception:
+    except Exception as e:
         analytics_ctx = ""
+        st.warning(f"⚠️ Análise quantitativa automática falhou: {e}")
 
     # Candle histórico exato (se pergunta mencionar data)
     hist_ctx = ""
@@ -727,11 +747,6 @@ PROBABILIDADE DE ROMPIMENTO — NÍVEL ${lbp['alvo']:,.0f} ({lbp['direcao']}):
 REGRA: Use esses números como base estatística para a resposta sobre esse nível."""
 
     fb = ""
-    if st.session_state.feedbacks:
-        fb = "\n\nFEEDBACKS ANTERIORES:\n"
-        for f in st.session_state.feedbacks[-15:]:
-            s = "ACERTOU" if f["result"] == "correct" else "ERROU"
-            fb += f"- {f['date']}: \"{f['query']}\" → {s}: {f['note']}\n"
 
     return f"""Você é um agente quantitativo especializado em Bitcoin com conhecimento histórico completo desde 2011.
 
@@ -751,7 +766,28 @@ REGRA: Use esses números como base estatística para a resposta sobre esse nív
 
 {SP500_YOUNG_MARKET_CONTEXT}
 
-REGRAS:
+═══════════════════════════════════════════════════════════════
+FORMATO DA RESPOSTA (PRIORIDADE MÁXIMA — resposta CURTA e direta):
+═══════════════════════════════════════════════════════════════
+Toda a análise/dados acima são a BASE do seu raciocínio, mas NÃO devem ser despejados no texto.
+O usuário quer só o necessário para entender — não um relatório. A resposta deve ser CURTA:
+no MÁXIMO ~12-15 linhas no total.
+
+- NÃO crie seções como "INDICADORES TÉCNICOS", "MACRO", "DERIVATIVOS", "VOLUME",
+  "SUPORTE/RESISTÊNCIA", "RISCOS", "CENÁRIOS A/B/C". Nada de tabelas grandes nem repetição.
+- Sem emojis decorativos, sem checkmarks (✅), sem repetir o mesmo número em vários lugares.
+- Estrutura EXATA da resposta, nesta ordem:
+  1) 1 linha de contexto: regime + preço + o análogo de maior score (data real + o que veio depois).
+  2) 2-4 bullets curtos com os fatos que MAIS pesam para a previsão (só os decisivos).
+  3) Bloco "PADRÕES PARECIDOS" — OBRIGATÓRIO, mas COMPACTO (1 linha por item, sem prosa):
+       - Os 2-3 análogos BTC do engine (PADRAO REAL MAIS SEMELHANTE + os do TOP do engine):
+         "ano-mês (forma X/100): caiu/subiu, depois 30d=__% 60d=__% 90d=__%". Cite a SEQUÊNCIA
+         estrutural que se repete (fundo→reclaim→furo→recuperação), não a % de queda.
+       - 1 análogo CROSS-MARKET S&P500 do engine: "ano (forma X/100): o que veio depois".
+       Use SÓ as datas que o engine listou. Não invente, não liste mais de 3 BTC + 1 S&P.
+  4) O bloco final "O QUE EU ESPERO DO PREÇO" (regra 17) — é o foco da resposta.
+
+REGRAS DE CONTEÚDO (regem o raciocínio — não viram seções no texto):
 1. Use os dados em tempo real — nunca invente valores de médias ou indicadores
 2. Use os padrões do ANÁLISE QUANTITATIVA AUTOMÁTICA para embasar probabilidades com frequência histórica real
 3. Quando houver CANDLE HISTÓRICO EXATO, use esses valores — nunca estime datas históricas
@@ -768,21 +804,29 @@ REGRAS:
 14. RSI tem BAIXO PESO nas análises — é um indicador lagging que aparece igual em bear markets e bull markets. Nunca use RSI como argumento principal de probabilidade. O critério principal de similaridade é a ESTRUTURA: distância do ATH do ciclo, posição no range, estrutura de topos/fundos.
 15. S&P500 próximo do ATH histórico (distância < 8%) em tendência de alta SIGNIFICA continuação de alta — NÃO é sinal de reversão. RSI do S&P500 acima de 60 em trend de alta é normal. Só considere S&P500 como risco se: RSI semanal > 80, ou queda já iniciada > 5%, ou dado macro específico (recessão, Fed hawkish extremo).
 16. Ao identificar análogos históricos, priorize períodos com mesma FASE estrutural: se BTC está -50% do ATH com death cross, os análogos devem ser de outros bear markets (-40% a -60% do ATH), NUNCA de bull markets que acidentalmente tenham o mesmo RSI.
-17. CONCLUSÃO DIRETA OBRIGATÓRIA: TODA resposta deve terminar com um bloco separado por linha em branco:
+17. CONCLUSÃO DIRETA OBRIGATÓRIA — É A PARTE MAIS IMPORTANTE E NUNCA PODE FALTAR:
+   TODA resposta DEVE terminar com este bloco. Ele responde DIRETAMENTE o que foi perguntado
+   (ex.: "o que o preço deve fazer nas próximas semanas"). Se faltar espaço, ENCURTE as seções
+   anteriores (menos análogos, menos texto) — esta conclusão JAMAIS pode ser cortada ou omitida.
+   Formato obrigatório, separado por linha em branco:
    "---
-   **CONCLUSÃO DIRETA:** [resposta clara e objetiva ao que foi perguntado, em 3-6 linhas. Citar o patamar mais provável, a probabilidade e o timing baseados nos dados. Nada de hedges genéricos — seja específico.]"
-   Esse bloco é o mais importante da resposta. O usuário lê ele primeiro.
-18. ANÁLOGO S&P500 OBRIGATÓRIO em análises estruturais: Quando identificar o padrão atual do BTC, SEMPRE citar qual período do S&P500 (ou jovem 1950-1982 ou moderno) mais se assemelha. Especificar: ano, contexto, o que aconteceu depois, e por que é relevante para o BTC agora. Usar os dados injetados do ANÁLOGOS S&P500 se disponíveis.
-19. CORRELAÇÃO HISTÓRICA BTC OBRIGATÓRIA em análises de correção/bear: Sempre incluir seção comparando explicitamente com 2018 e 2022 (os dois bears mais documentados). Estrutura:
-   - 2018: O que era IGUAL ao hoje | O que era DIFERENTE | O que aconteceu depois
-   - 2022: O que era IGUAL ao hoje | O que era DIFERENTE | O que aconteceu depois
-   - CONCLUSÃO COMPARATIVA: o que esses dois cases ensinam para o momento atual
-   Nunca pular essa seção quando a pergunta envolver bear market, correção, fundo, ou análise de ciclo.
+   **O QUE EU ESPERO DO PREÇO (próximas 2-6 semanas):**
+   • Cenário base (mais provável): [direção — alta/baixa/lateral] até [alvo $X] em [prazo], probabilidade [Y%]. 1 frase do porquê (estrutura + análogo principal).
+   • Cenário alternativo: [direção] até [$Z], probabilidade [W%].
+   • Gatilho que muda a tese: [nível/evento que invalida o cenário base — ex.: perder $X ou recuperar a EMA50 semanal]."
+   Regras do bloco: dê uma direção clara e um número (não fique em cima do muro); as probabilidades
+   dos cenários devem somar ~100%; baseie tudo nos análogos reais e indicadores — sem hedge genérico.
+18. ANÁLOGO S&P500: se o engine listou ANALOGOS CROSS-MARKET S&P500, inclua 1 deles (o de maior forma/score) no bloco "PADRÕES PARECIDOS", em 1 linha (ano + forma + o que veio depois). Não crie seção própria.
+19. CORRELAÇÃO HISTÓRICA BTC — CONCISA (máx 3-4 linhas no total): em análises de correção/bear,
+   priorize o análogo de MAIOR score que o engine retornou (pode ser 2018, 2022, 2014 etc.) e
+   foque no CENÁRIO/SEQUÊNCIA estrutural que se repete (fundo → reclaim de média → furo → recuperação),
+   NÃO na % de queda (o mercado era menor e mais volátil antes — magnitude não é comparável).
+   Em 1-2 linhas: o que a estrutura era igual, e o que veio depois. Não escreva seções longas de IGUAL/DIFERENTE.
 20. NEUTRALIDADE ABSOLUTA — SEM BIAS: Apresentar dados como são, sem spin positivo ou negativo. Proibido usar "mas" para minimizar dados bearish em bear market. Proibido usar checkmarks (✅) em colunas de comparação para sugerir que o cenário atual é melhor sem dados que confirmem isso. Proibido concluir "recuperação" quando estamos em bear market confirmado.
 21. INTERPRETAÇÃO CORRETA DE ESTRUTURA CURTA EM BEAR MARKET: O campo trend_structure (HH_HL, LH_LL etc) do fingerprint descreve a estrutura LOCAL de 90 dias, NÃO o regime geral de mercado. Em um BEAR MARKET CONFIRMADO pela EMA50 semanal, qualquer HH_HL de curto prazo = dead cat bounce / armadilha de bear. NUNCA interprete HH_HL como "recuperação bullish" ou "correção em bull market" quando bear_status_btc mostra BEAR MARKET CONFIRMADO. O regime macro (EMA50 semanal) SEMPRE prevalece sobre a estrutura local de 90 dias.
 22. ANALOGOS INVÁLIDOS EM BEAR MARKET: Quando bear_status_btc = BEAR MARKET CONFIRMADO, os seguintes análogos são INVÁLIDOS e devem ser descartados: (a) COVID crash de mar/2020 — foi um crash de liquidez de 24h em pleno bull market, BTC ficou abaixo do ATH por menos de 7 dias; (b) qualquer período onde o BTC estava a menos de 20% do ATH; (c) qualquer período de bull market (EMA50 semanal acima). Usar SOMENTE análogos de outros bear markets confirmados (BTC -40% a -85% do ATH por 2+ meses).
-23. DIVERGÊNCIA BTC vs S&P500 OBRIGATÓRIA: Se o bloco "DIVERGENCIA BTC vs S&P500" mostrar divergência >15pp, isso é o sinal mais importante da análise. Significa que BTC está em fraqueza específica — NÃO é uma correção de mercado amplo. Nesse contexto, análogos históricos onde o mercado amplo também caiu (2018, 2022) são menos relevantes que análogos onde apenas o BTC caiu com o macro positivo.
-24. ANÁLOGOS VÊM DO PATTERN ENGINE — PROIBIDO INVENTAR ANO: O bloco "RECONHECIMENTO DE PADROES ESTRUTURAIS" já calculou os análogos reais do BTC com DATAS REAIS (ex.: "2018-09") e o "PADRAO REAL MAIS SEMELHANTE". Cite SOMENTE os períodos que aparecem nesse bloco. Se um ano NÃO está na saída do engine, está PROIBIDO citá-lo como análogo do BTC. Nunca diga "set/2017" ou "mar/2015" se a engine não listou — isso é alucinação. Comece a análise pelo PADRAO REAL MAIS SEMELHANTE (maior score).
+23. DIVERGÊNCIA BTC vs S&P500: se >15pp, mencione em 1 bullet curto (fraqueza específica do BTC, não correção de mercado amplo). Sem seção própria.
+24. ANÁLOGOS VÊM DO PATTERN ENGINE — PROIBIDO INVENTAR ANO OU REGIME: O bloco "RECONHECIMENTO DE PADROES ESTRUTURAIS" já calculou os análogos reais com DATAS REAIS e o score por TRAJETÓRIA. Cite SOMENTE os períodos que aparecem nesse bloco; se um ano não está lá, é PROIBIDO citá-lo. Comece pelo PADRAO REAL MAIS SEMELHANTE (maior score). PROIBIDO rotular um análogo como "bull em desenvolvimento", "bull recovery" etc. por conta própria — quando o regime atual é BEAR, o engine já filtrou e só lista BEARS REAIS (descartou correções de bull que se recuperaram). Use a fase/regime que o engine forneceu; não reinterprete.
 25. FALSA RUPTURA + RECLAIM → 2018: Se o fingerprint mostrar "FALSA RUPTURA + RECLAIM: SIM", isso é a assinatura do padrão de $6k em 2018 (rompeu o suporte de leve e voltou). Compare EXPLICITAMENTE com 2018: o que aconteceu (algumas falsas rupturas reverteram, mas a ruptura final com volume alto confirmou o breakdown para $3.1k). Diga o que diferencia reclaim (volume baixo no furo) de breakdown real (volume alto).
 26. CROSS-MARKET LIBERADO (S&P500 + Ouro 1970s + NASDAQ jovem): Para achar "situações parecidas em outros mercados", use os ANALOGOS CROSS-MARKET S&P500 do engine (datas reais) E pode citar os ciclos de Ouro 1971-1980 e NASDAQ jovem do contexto narrativo QUANDO a estrutura gráfica for parecida (não precisa ser bear — pode ser qualquer regime, desde que a forma case). Sempre priorize o de MAIOR semelhança estrutural. O objetivo é achar o gráfico mais parecido possível com o cenário atual do BTC.{fb}"""
 
@@ -796,7 +840,7 @@ def send_message(api_key, user_msg, ind, macro, deriv, historical_candle=None, l
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01",
                      "content-type": "application/json"},
-            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 2500,
+            json={"model": "claude-haiku-4-5-20251001", "max_tokens": 4000,
                   "system": build_prompt(ind, macro, deriv, historical_candle, level_target, sp500_ctx, pattern_ctx),
                   "messages": msgs},
             timeout=60
@@ -838,6 +882,7 @@ with st.sidebar:
 
 st.title("₿ Agente BTC")
 st.caption("Análise quantitativa — histórico completo desde 2017 + RSI + MACD + Bollinger + macro + derivativos")
+st.caption(f"🧬 Pattern Engine: {PATTERN_ENGINE_VERSION}")
 
 with st.spinner("Carregando dados históricos..."):
     ind          = get_indicators()
@@ -946,39 +991,6 @@ for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Feedback discreto — aparece ABAIXO do chat, em expander fechado por padrão
-if st.session_state.messages and st.session_state.messages[-1]["role"] == "assistant":
-    last_i = len(st.session_state.messages) - 1
-    with st.expander("📝 Avaliar última resposta", expanded=False):
-        ca, cb = st.columns([1, 1])
-        if ca.button("✓ Acertou", key=f"ok{last_i}"):
-            uq = st.session_state.messages[last_i-1]["content"][:80] if last_i > 0 else ""
-            st.session_state.feedbacks.append({
-                "date": datetime.now().strftime("%d/%m/%Y"),
-                "query": uq, "result": "correct", "note": "confirmado"
-            })
-            save_feedbacks()
-            st.success("Registrado!")
-        if cb.button("✗ Errou", key=f"no{last_i}"):
-            st.session_state[f"fb{last_i}"] = True
-        if st.session_state.get(f"fb{last_i}"):
-            note = st.text_input("O que aconteceu diferente?", key=f"note{last_i}")
-            if st.button("Salvar feedback", key=f"sv{last_i}"):
-                uq = st.session_state.messages[last_i-1]["content"][:80] if last_i > 0 else ""
-                st.session_state.feedbacks.append({
-                    "date": datetime.now().strftime("%d/%m/%Y"),
-                    "query": uq, "result": "wrong", "note": note or "sem detalhe"
-                })
-                save_feedbacks()
-                st.session_state[f"fb{last_i}"] = False
-
-if st.session_state.feedbacks:
-    with st.expander(f"🧠 Memória — {len(st.session_state.feedbacks)} feedbacks"):
-        for fb in reversed(st.session_state.feedbacks[-8:]):
-            icon = "✓" if fb["result"] == "correct" else "✗"
-            cor = "green" if fb["result"] == "correct" else "red"
-            st.markdown(f":{cor}[{icon}] **{fb['date']}** — _{fb['query']}_ → {fb['note']}")
-
 prompt = st.chat_input("Pergunte qualquer coisa sobre o BTC...")
 final_prompt = triggered or prompt
 
@@ -1052,8 +1064,9 @@ if final_prompt:
                     "================================================================\n"
                 )
                 sp500_ctx = div_block + sp500_ctx
-        except Exception:
+        except Exception as e:
             sp500_ctx = ""
+            st.warning(f"⚠️ Contexto S&P500 falhou — divergência/análogos cross-market indisponíveis: {e}")
 
     # Pattern engine — fingerprint + análogos históricos BTC e S&P500
     pattern_ctx = ""
@@ -1077,8 +1090,9 @@ if final_prompt:
                 btc_timestamps=btc_ts_raw if btc_ts_raw else None,
                 regime=regime,
             )
-    except Exception:
+    except Exception as e:
         pattern_ctx = ""
+        st.warning(f"⚠️ Pattern engine falhou — análogos por trajetória indisponíveis nesta resposta: {e}")
 
     with st.chat_message("user"):
         st.markdown(final_prompt)
